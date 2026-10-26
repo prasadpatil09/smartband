@@ -1,0 +1,24 @@
+.fall-ai-panel{margin-top:15px;padding:21px 22px}
+.model-tag{display:inline-flex;align-items:center;gap:7px;padding:7px 10px;border-radius:20px;background:#f2f0fb;color:#7267b2;font-size:9px;font-weight:700}
+.motion-result{display:flex;align-items:center;gap:12px;margin-top:17px;padding:14px 15px;border:1px solid #ecebf2;border-radius:13px;background:#fbfbfd}
+.motion-result-icon{display:grid;place-items:center;width:38px;height:38px;flex:none;border-radius:12px;background:#eeebff;color:#7565df}
+.motion-result-copy{display:grid;gap:4px;min-width:0}
+.motion-result-copy b{font:700 13px var(--font-head);color:#333449}
+.motion-result-copy small{font-size:10px;color:#8f91a0}
+.motion-score{margin-left:auto;display:grid;justify-items:center;min-width:48px;color:#5f55bf;font:800 20px var(--font-head)}
+.motion-score small{font:600 8px 'DM Sans',sans-serif;color:#999aaa;text-transform:uppercase;letter-spacing:.5px}
+.motion-alert{background:#fff9f5;border-color:#f1dfd7}
+.motion-alert .motion-result-icon{background:#fff0e9;color:#c77757}
+.motion-alert .motion-result-copy b,.motion-score.warn{color:#b3654c}
+.motion-context{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-top:10px}
+.motion-context>span{display:grid;gap:5px;padding:11px 13px;border:1px solid #efedf3;border-radius:11px;background:#fff}
+.motion-context small{font-size:8px;letter-spacing:.7px;color:#9698a7;font-weight:700}
+.motion-context b{font:700 12px var(--font-head);color:#333449}
+.motion-notice{margin:12px 1px 0;color:#8c8e9c;font-size:9px;line-height:1.6}
+.motion-notice.error{color:#b96554}
+:root[data-theme="dark"] .model-tag,:root[data-theme="dark"] .motion-result,:root[data-theme="dark"] .motion-context>span{background:#22232f;border-color:#383947;color:#c4c5d0}
+:root[data-theme="dark"] .motion-result-copy b,:root[data-theme="dark"] .motion-context b{color:#e4e5ed}
+:root[data-theme="dark"] .motion-result-copy small,:root[data-theme="dark"] .motion-context small,:root[data-theme="dark"] .motion-notice{color:#a8a9b7}
+:root[data-theme="dark"] .motion-alert{background:#302526;border-color:#59403c}
+:root[data-theme="dark"] .motion-alert .motion-result-copy b{color:#efa38e}
+@media(max-width:560px){.fall-ai-panel{padding:15px 13px}.motion-context{grid-template-columns:1fr 1fr}.motion-context>span:last-child{grid-column:span 2}.motion-result{padding:11px;gap:9px}.motion-result-copy b{font-size:11px}.motion-result-copy small{font-size:9px}}

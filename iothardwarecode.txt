@@ -1,0 +1,1152 @@
+#include <Wire.h>
+#include <math.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include "MAX30105.h"
+#include "spo2_algorithm.h"
+
+// ================= WIFI =================
+const char* WIFI_SSID = "SUNDAR";
+const char* WIFI_PASSWORD = "sundar@123";
+
+// ================= API =================
+const char* API_URL = "https://nugget-nanometer-jolt.ngrok-free.dev/api/data";
+const char* MOTION_API_URL = "https://nugget-nanometer-jolt.ngrok-free.dev/api/motion";
+
+const char* DEVICE_ID = "BAND001";
+
+// ================= MPU MOTION UPLOAD =================
+// Collect 10 samples per second (100 ms apart) and upload them as one batch.
+struct MotionSample {
+  unsigned long tMs;
+  float x;
+  float y;
+  float z;
+  float magnitude;
+};
+
+const int MOTION_BATCH_SIZE = 10;
+const unsigned long MOTION_SAMPLE_INTERVAL_MS = 100;
+const unsigned long MOTION_RETRY_INTERVAL_MS = 3000;
+
+MotionSample motionSamples[MOTION_BATCH_SIZE];
+int motionSampleCount = 0;
+unsigned long motionBatchStartedAt = 0;
+unsigned long lastMotionSampleAt = 0;
+unsigned long lastMotionUploadAttemptAt = 0;
+
+// WiFi check interval
+unsigned long lastWiFiCheck = 0;
+const unsigned long WIFI_CHECK_INTERVAL = 10000;
+
+// Send data every 30 seconds
+unsigned long lastDataSend = 0;
+const unsigned long DATA_SEND_INTERVAL = 30000;
+
+// ================= PINS =================
+#define MPU_ADDR 0x68
+
+#define MOTOR_PIN 25
+#define BUZZER_PIN 26
+#define GREEN_LED 27
+#define RED_LED 14
+#define SOS_BUTTON_PIN 33
+
+// ================= MAX30102 =================
+MAX30105 maxSensor;
+
+#define BUFFER_SIZE 100
+
+uint32_t irBuffer[BUFFER_SIZE];
+uint32_t redBuffer[BUFFER_SIZE];
+
+int sampleCount = 0;
+
+const uint32_t FINGER_PRESENT_IR_THRESHOLD = 50000;
+const uint32_t FINGER_ABSENT_IR_THRESHOLD = 40000;
+
+bool fingerOnSensor = false;
+uint32_t latestIRReading = 0;
+unsigned long lastOpticalSampleAt = 0;
+
+int32_t spo2Raw;
+int8_t validSPO2;
+
+int32_t heartRateRaw;
+int8_t validHeartRate;
+
+int lastValidBPM = 0;
+int lastValidSpO2 = 0;
+
+unsigned long lastValidBPMAt = 0;
+unsigned long lastValidSpO2At = 0;
+
+const unsigned long VITALS_MAX_AGE = 10000;
+
+unsigned long lastVitalsCompute = 0;
+const unsigned long VITALS_INTERVAL = 3500;
+
+// ================= FALL DETECTION =================
+bool alertActive = false;
+
+// Pending events remain pending until successfully uploaded
+bool fallEventPending = false;
+bool sosEventPending = false;
+
+// Fall alert sequence
+bool fallAlarmActive = false;
+bool fallDetectedLatched = false;
+
+unsigned long fallAlarmStartedAt = 0;
+
+const unsigned long ALARM_STEP_MS = 2000;
+const unsigned long FALL_ALARM_TOTAL_MS = 8000;
+
+// ================= SOS BUTTON =================
+const unsigned long BUTTON_DEBOUNCE_MS = 40;
+const unsigned long DOUBLE_PRESS_WINDOW_MS = 2000;
+
+bool lastButtonReading = HIGH;
+bool stableButtonState = HIGH;
+
+unsigned long lastButtonChange = 0;
+
+int alarmButtonPressCount = 0;
+unsigned long lastAlarmButtonPressAt = 0;
+
+// ================= MPU6050 SHAKE-DEMO DETECTION =================
+// Code 2: sustained noticeable shaking is treated as a fall for demo use.
+// Small/brief movements are ignored. Tune these thresholds using MAG readings.
+const float MOVEMENT_LOW_G = 0.75;
+const float MOVEMENT_HIGH_G = 1.35;
+
+const unsigned long SHAKE_MIN_DURATION_MS = 700;
+const unsigned long SHAKE_DETECTION_WINDOW_MS = 1200;
+const unsigned long SHAKE_GAP_RESET_MS = 350;
+const int SHAKE_REQUIRED_SAMPLES = 2;
+
+unsigned long shakeStartedAt = 0;
+unsigned long lastShakeSampleAt = 0;
+unsigned long shakeWindowStartedAt = 0;
+int shakeSampleCount = 0;
+bool shakeWindowActive = false;
+
+// The original physical-fall sequence remains available as well:
+// 1) low acceleration/freefall, 2) strong impact, 3) stillness.
+const float FREEFALL_THRESHOLD = 0.80;
+const float IMPACT_THRESHOLD = 2.20;
+
+const float STILLNESS_MIN_G = 0.75;
+const float STILLNESS_MAX_G = 1.25;
+
+const unsigned long IMPACT_WINDOW_MS = 1200;
+const unsigned long STILLNESS_REQUIRED_MS = 1500;
+
+bool freefallSeen = false;
+bool impactSeen = false;
+
+unsigned long freefallAt = 0;
+unsigned long impactAt = 0;
+unsigned long stillnessStartedAt = 0;
+
+// ================= GREEN LED =================
+unsigned long lastGreenBlink = 0;
+bool greenState = false;
+
+const unsigned long GREEN_BLINK_INTERVAL = 1000;
+
+
+// =================================================
+// WIFI CONNECTION
+// =================================================
+
+void connectWiFi() {
+
+  Serial.println();
+  Serial.print("Connecting to WiFi: ");
+  Serial.println(WIFI_SSID);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  int attempts = 0;
+
+  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("WiFi CONNECTED");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("WiFi connection failed.");
+    Serial.println("System will continue without WiFi.");
+  }
+}
+
+
+// =================================================
+// CHECK WIFI
+// =================================================
+
+void checkWiFi() {
+
+  if (millis() - lastWiFiCheck < WIFI_CHECK_INTERVAL)
+    return;
+
+  lastWiFiCheck = millis();
+
+  if (WiFi.status() != WL_CONNECTED) {
+
+    Serial.println("WiFi disconnected.");
+    Serial.println("Trying to reconnect...");
+
+    WiFi.disconnect();
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  } else {
+    Serial.println("WiFi: Connected");
+  }
+}
+
+
+// =================================================
+// MPU6050 WRITE
+// =================================================
+
+void writeMPU(byte reg, byte value) {
+
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(reg);
+  Wire.write(value);
+  Wire.endTransmission();
+}
+
+
+// =================================================
+// MPU6050 READ ACCELERATION
+// =================================================
+
+bool readAccel(float &x, float &y, float &z) {
+
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x3B);
+  Wire.endTransmission(false);
+
+  Wire.requestFrom(MPU_ADDR, 6);
+
+  if (Wire.available() == 6) {
+
+    int16_t ax = Wire.read() << 8 | Wire.read();
+    int16_t ay = Wire.read() << 8 | Wire.read();
+    int16_t az = Wire.read() << 8 | Wire.read();
+
+    x = ax / 16384.0;
+    y = ay / 16384.0;
+    z = az / 16384.0;
+
+    return true;
+  }
+
+  return false;
+}
+
+
+// =================================================
+// COLLECT AND UPLOAD MPU6050 MOTION DATA
+// =================================================
+
+void sendMotionBatch() {
+  if (motionSampleCount < MOTION_BATCH_SIZE)
+    return;
+
+  unsigned long now = millis();
+
+  if (WiFi.status() != WL_CONNECTED) {
+    if (now - lastMotionUploadAttemptAt >= MOTION_RETRY_INTERVAL_MS) {
+      lastMotionUploadAttemptAt = now;
+      Serial.println("Motion batch waiting: WiFi disconnected.");
+    }
+    return;
+  }
+
+  if (lastMotionUploadAttemptAt != 0 &&
+      now - lastMotionUploadAttemptAt < MOTION_RETRY_INTERVAL_MS) {
+    return;
+  }
+
+  lastMotionUploadAttemptAt = now;
+
+  String json = "{";
+  json += "\"deviceId\":\"";
+  json += DEVICE_ID;
+  json += "\",";
+  json += "\"sampleRateHz\":10,";
+  json += "\"accelUnit\":\"g\",";
+  json += "\"samples\":[";
+
+  for (int i = 0; i < motionSampleCount; i++) {
+    if (i > 0)
+      json += ",";
+
+    json += "{";
+    json += "\"tMs\":";
+    json += String(motionSamples[i].tMs);
+    json += ",\"x\":";
+    json += String(motionSamples[i].x, 3);
+    json += ",\"y\":";
+    json += String(motionSamples[i].y, 3);
+    json += ",\"z\":";
+    json += String(motionSamples[i].z, 3);
+    json += ",\"magnitude\":";
+    json += String(motionSamples[i].magnitude, 3);
+    json += "}";
+  }
+
+  json += "]}";
+
+  Serial.println("========== SENDING MOTION BATCH ==========");
+  Serial.println(json);
+
+  HTTPClient http;
+  http.begin(MOTION_API_URL);
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(3000);
+
+  int responseCode = http.POST(json);
+
+  Serial.print("Motion API response code: ");
+  Serial.println(responseCode);
+
+  if (responseCode >= 200 && responseCode < 300) {
+    Serial.println("Motion batch uploaded successfully.");
+    motionSampleCount = 0;
+    motionBatchStartedAt = 0;
+    lastMotionUploadAttemptAt = 0;
+  } else {
+    Serial.println("Motion batch upload failed; keeping batch for retry.");
+  }
+
+  http.end();
+}
+
+void collectMotionSample() {
+  unsigned long now = millis();
+
+  // Retry a full batch if the previous upload failed.
+  if (motionSampleCount >= MOTION_BATCH_SIZE) {
+    sendMotionBatch();
+    return;
+  }
+
+  if (now - lastMotionSampleAt < MOTION_SAMPLE_INTERVAL_MS)
+    return;
+
+  lastMotionSampleAt = now;
+
+  float x, y, z;
+  if (!readAccel(x, y, z)) {
+    Serial.println("MPU motion sample read failed.");
+    return;
+  }
+
+  if (motionSampleCount == 0)
+    motionBatchStartedAt = now;
+
+  MotionSample &sample = motionSamples[motionSampleCount];
+  sample.tMs = (unsigned long)motionSampleCount * MOTION_SAMPLE_INTERVAL_MS;
+  sample.x = x;
+  sample.y = y;
+  sample.z = z;
+  sample.magnitude = sqrt(x * x + y * y + z * z);
+
+  motionSampleCount++;
+
+  if (motionSampleCount >= MOTION_BATCH_SIZE)
+    sendMotionBatch();
+}
+
+
+// =================================================
+// COLLECT MAX30102 DATA
+// =================================================
+
+void collectVitalsSample() {
+
+  maxSensor.check();
+
+  while (maxSensor.available()) {
+
+    uint32_t ir = maxSensor.getIR();
+    uint32_t red = maxSensor.getRed();
+
+    maxSensor.nextSample();
+
+    latestIRReading = ir;
+    lastOpticalSampleAt = millis();
+
+    if (!fingerOnSensor &&
+        ir >= FINGER_PRESENT_IR_THRESHOLD) {
+
+      fingerOnSensor = true;
+
+      Serial.println(
+        "MAX30102: finger detected; collecting vitals."
+      );
+
+      sampleCount = 0;
+
+      lastValidBPM = 0;
+      lastValidSpO2 = 0;
+      lastValidBPMAt = 0;
+      lastValidSpO2At = 0;
+
+    } else if (fingerOnSensor &&
+               ir < FINGER_ABSENT_IR_THRESHOLD) {
+
+      fingerOnSensor = false;
+      sampleCount = 0;
+
+      lastValidBPM = 0;
+      lastValidSpO2 = 0;
+      lastValidBPMAt = 0;
+      lastValidSpO2At = 0;
+
+      Serial.println(
+        "MAX30102: finger removed; clearing stored vitals."
+      );
+    }
+
+    if (!fingerOnSensor) {
+      sampleCount = 0;
+      continue;
+    }
+
+    if (sampleCount < BUFFER_SIZE) {
+
+      irBuffer[sampleCount] = ir;
+      redBuffer[sampleCount] = red;
+      sampleCount++;
+
+    } else {
+
+      for (int i = 1; i < BUFFER_SIZE; i++) {
+        irBuffer[i - 1] = irBuffer[i];
+        redBuffer[i - 1] = redBuffer[i];
+      }
+
+      irBuffer[BUFFER_SIZE - 1] = ir;
+      redBuffer[BUFFER_SIZE - 1] = red;
+    }
+  }
+}
+
+
+// =================================================
+// CALCULATE HEART RATE + SPO2
+// =================================================
+
+void computeVitalsIfDue() {
+
+  if (!fingerOnSensor ||
+      millis() - lastOpticalSampleAt > 2000)
+    return;
+
+  if (sampleCount < BUFFER_SIZE)
+    return;
+
+  if (millis() - lastVitalsCompute < VITALS_INTERVAL)
+    return;
+
+  maxim_heart_rate_and_oxygen_saturation(
+    irBuffer,
+    BUFFER_SIZE,
+    redBuffer,
+    &spo2Raw,
+    &validSPO2,
+    &heartRateRaw,
+    &validHeartRate
+  );
+
+  if (validHeartRate &&
+      heartRateRaw > 30 &&
+      heartRateRaw < 220) {
+
+    lastValidBPM = heartRateRaw;
+    lastValidBPMAt = millis();
+  }
+
+  if (validSPO2 &&
+      spo2Raw > 50 &&
+      spo2Raw <= 100) {
+
+    lastValidSpO2 = spo2Raw;
+    lastValidSpO2At = millis();
+  }
+
+  Serial.println();
+  Serial.println("========== HEALTH DATA ==========");
+
+  Serial.print("SpO2 algorithm: raw=");
+  Serial.print(spo2Raw);
+  Serial.print(" valid=");
+  Serial.println(validSPO2);
+
+  if (lastValidBPM > 0 &&
+      millis() - lastValidBPMAt <= VITALS_MAX_AGE) {
+
+    Serial.print("Heart Rate: ");
+    Serial.print(lastValidBPM);
+    Serial.println(" BPM");
+
+  } else {
+    Serial.println("Heart Rate: Waiting...");
+  }
+
+  if (lastValidSpO2 > 0 &&
+      millis() - lastValidSpO2At <= VITALS_MAX_AGE) {
+
+    Serial.print("SpO2: ");
+    Serial.print(lastValidSpO2);
+    Serial.println(" %");
+
+  } else {
+    Serial.println("SpO2: Waiting...");
+  }
+
+  Serial.println("=================================");
+  Serial.println();
+
+  lastVitalsCompute = millis();
+}
+
+
+// =================================================
+// FALL DETECTION
+// =================================================
+
+void updateFallDetection() {
+
+  float x, y, z;
+
+  if (!readAccel(x, y, z)) {
+    Serial.println("MPU READ ERROR");
+    return;
+  }
+
+  float magnitude = sqrt(x * x + y * y + z * z);
+
+  Serial.print("X: ");
+  Serial.print(x, 2);
+
+  Serial.print(" | Y: ");
+  Serial.print(y, 2);
+
+  Serial.print(" | Z: ");
+  Serial.print(z, 2);
+
+  Serial.print(" | MAG: ");
+  Serial.print(magnitude, 2);
+
+  unsigned long now = millis();
+
+  // Code 2 demo logic:
+  // Treat repeated, noticeable acceleration changes over ~0.7 seconds
+  // as a fall. A single bump or tiny movement is not enough.
+  bool noticeableMovement =
+      (magnitude < MOVEMENT_LOW_G || magnitude > MOVEMENT_HIGH_G);
+
+  if (!alertActive && !fallAlarmActive) {
+    if (noticeableMovement) {
+      if (!shakeWindowActive ||
+          now - shakeWindowStartedAt > SHAKE_DETECTION_WINDOW_MS ||
+          now - lastShakeSampleAt > SHAKE_GAP_RESET_MS) {
+
+        shakeWindowActive = true;
+        shakeWindowStartedAt = now;
+        shakeStartedAt = now;
+        shakeSampleCount = 1;
+
+      } else {
+        shakeSampleCount++;
+      }
+
+      lastShakeSampleAt = now;
+
+      Serial.print(" | Shake samples: ");
+      Serial.print(shakeSampleCount);
+
+      if (now - shakeStartedAt >= SHAKE_MIN_DURATION_MS &&
+          shakeSampleCount >= SHAKE_REQUIRED_SAMPLES) {
+
+        Serial.println();
+        Serial.println("DEMO FALL DETECTED: sustained shaking");
+
+        alertActive = true;
+        fallAlarmActive = true;
+        fallDetectedLatched = true;
+        fallAlarmStartedAt = now;
+
+        alarmButtonPressCount = 0;
+        fallEventPending = true;
+
+        // Clear both detection paths so the same shake cannot retrigger.
+        freefallSeen = false;
+        impactSeen = false;
+        stillnessStartedAt = 0;
+        shakeWindowActive = false;
+        shakeSampleCount = 0;
+      } else {
+        Serial.println(" | Noticeable movement");
+      }
+    } else {
+      Serial.println(" | Within normal range");
+      if (shakeWindowActive &&
+          now - lastShakeSampleAt > SHAKE_GAP_RESET_MS) {
+        shakeWindowActive = false;
+        shakeSampleCount = 0;
+      }
+    }
+  } else {
+    Serial.println(" | Alarm active");
+  }
+
+
+  if (!alertActive &&
+      !impactSeen &&
+      magnitude <= FREEFALL_THRESHOLD) {
+
+    freefallSeen = true;
+    freefallAt = now;
+  }
+
+  if (freefallSeen &&
+      !impactSeen &&
+      now - freefallAt <= IMPACT_WINDOW_MS &&
+      magnitude >= IMPACT_THRESHOLD) {
+
+    impactSeen = true;
+    impactAt = now;
+    stillnessStartedAt = 0;
+  }
+
+  if (freefallSeen &&
+      !impactSeen &&
+      now - freefallAt > IMPACT_WINDOW_MS) {
+
+    freefallSeen = false;
+  }
+
+  if (impactSeen) {
+
+    if (magnitude >= STILLNESS_MIN_G &&
+        magnitude <= STILLNESS_MAX_G) {
+
+      if (stillnessStartedAt == 0) {
+        stillnessStartedAt = now;
+      }
+
+      if (now - stillnessStartedAt >= STILLNESS_REQUIRED_MS &&
+          !alertActive) {
+
+        Serial.println(
+          "FALL CONFIRMED: impact followed by stillness"
+        );
+
+        alertActive = true;
+        fallAlarmActive = true;
+        fallDetectedLatched = true;
+
+        fallAlarmStartedAt = now;
+
+        alarmButtonPressCount = 0;
+        fallEventPending = true;
+
+        freefallSeen = false;
+        impactSeen = false;
+        stillnessStartedAt = 0;
+      }
+
+    } else {
+      stillnessStartedAt = 0;
+    }
+
+    if (now - impactAt > 5000) {
+
+      impactSeen = false;
+      freefallSeen = false;
+      stillnessStartedAt = 0;
+    }
+  }
+}
+
+
+// =================================================
+// SOS BUTTON
+// =================================================
+
+void updateSOSButton() {
+
+  bool reading = digitalRead(SOS_BUTTON_PIN);
+  unsigned long now = millis();
+
+  if (reading != lastButtonReading) {
+    lastButtonChange = now;
+    lastButtonReading = reading;
+  }
+
+  if (now - lastButtonChange >= BUTTON_DEBOUNCE_MS &&
+      reading != stableButtonState) {
+
+    stableButtonState = reading;
+
+    if (stableButtonState == LOW) {
+
+      // Every button press requests an SOS database event.
+      sosEventPending = true;
+
+      Serial.println("SOS event queued for database upload.");
+
+      if (alertActive) {
+
+        if (alarmButtonPressCount == 1 &&
+            now - lastAlarmButtonPressAt <= DOUBLE_PRESS_WINDOW_MS) {
+
+          alarmButtonPressCount = 0;
+
+          alertActive = false;
+          fallAlarmActive = false;
+
+          Serial.println("Emergency alarm acknowledged.");
+
+        } else {
+
+          alarmButtonPressCount = 1;
+          lastAlarmButtonPressAt = now;
+
+          Serial.println(
+            "Press again within 2 seconds to acknowledge the alarm."
+          );
+        }
+
+      } else {
+
+        alertActive = true;
+        fallAlarmActive = false;
+
+        alarmButtonPressCount = 0;
+
+        Serial.println("SOS button pressed: emergency alert active.");
+      }
+    }
+  }
+
+  if (alarmButtonPressCount == 1 &&
+      now - lastAlarmButtonPressAt > DOUBLE_PRESS_WINDOW_MS) {
+
+    alarmButtonPressCount = 0;
+  }
+}
+
+
+// =================================================
+// BUZZER + MOTOR + LED
+// =================================================
+
+void updateIndicators() {
+
+  unsigned long now = millis();
+
+  // Fall alert sequence:
+  // 0-2 sec: buzzer
+  // 2-4 sec: motor
+  // 4-6 sec: buzzer
+  // 6-8 sec: motor
+  // After 8 sec: stop automatically
+
+  if (fallAlarmActive) {
+
+    unsigned long elapsed = now - fallAlarmStartedAt;
+
+    if (elapsed >= FALL_ALARM_TOTAL_MS) {
+
+      fallAlarmActive = false;
+      alertActive = false;
+
+      digitalWrite(BUZZER_PIN, LOW);
+      digitalWrite(MOTOR_PIN, LOW);
+
+      Serial.println("Fall alert sequence completed.");
+
+    } else {
+
+      unsigned long phase = elapsed / ALARM_STEP_MS;
+
+      if (phase == 0 || phase == 2) {
+
+        digitalWrite(BUZZER_PIN, HIGH);
+        digitalWrite(MOTOR_PIN, LOW);
+
+      } else {
+
+        digitalWrite(BUZZER_PIN, LOW);
+        digitalWrite(MOTOR_PIN, HIGH);
+      }
+    }
+
+  } else if (alertActive) {
+
+    // Preserve the existing continuous SOS alarm behavior.
+    digitalWrite(BUZZER_PIN, HIGH);
+    digitalWrite(MOTOR_PIN, HIGH);
+
+  } else {
+    // No alert: keep buzzer and motor OFF.
+    // Sustained shaking starts the full fall-alarm sequence above.
+    digitalWrite(BUZZER_PIN, LOW);
+    digitalWrite(MOTOR_PIN, LOW);
+  }
+
+  // Red LED stays ON after a confirmed fall.
+  digitalWrite(
+    RED_LED,
+    fallDetectedLatched ? HIGH : LOW
+  );
+
+  // Green LED blinks only during normal operation.
+  if (alertActive || fallDetectedLatched) {
+
+    digitalWrite(GREEN_LED, LOW);
+    greenState = false;
+    lastGreenBlink = now;
+
+  } else if (now - lastGreenBlink >= GREEN_BLINK_INTERVAL) {
+
+    greenState = !greenState;
+
+    digitalWrite(
+      GREEN_LED,
+      greenState ? HIGH : LOW
+    );
+
+    lastGreenBlink = now;
+  }
+}
+
+
+// =================================================
+// SEND JSON TO BACKEND
+// =================================================
+
+void sendHealthJSON() {
+
+  if (!fallEventPending &&
+      !sosEventPending &&
+      millis() - lastDataSend < DATA_SEND_INTERVAL) {
+
+    return;
+  }
+
+  lastDataSend = millis();
+
+  bool fingerPresentNow =
+      fingerOnSensor &&
+      millis() - lastOpticalSampleAt <= 2000;
+
+  // Do not upload routine health rows without a finger.
+  // Emergency events can still be uploaded without vitals.
+  if (!fingerPresentNow &&
+      !fallEventPending &&
+      !sosEventPending) {
+
+    Serial.println(
+      "No finger detected; skipping routine health upload."
+    );
+
+    return;
+  }
+
+  bool spo2IsFresh =
+      fingerPresentNow &&
+      lastValidSpO2 > 0 &&
+      millis() - lastValidSpO2At <= VITALS_MAX_AGE;
+
+  if (!spo2IsFresh &&
+      !fallEventPending &&
+      !sosEventPending) {
+
+    Serial.println(
+      "SpO2 is not valid yet; skipping routine health upload."
+    );
+
+    return;
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+
+    Serial.println(
+      "Cannot send data - WiFi disconnected."
+    );
+
+    return;
+  }
+
+  // ================= JSON =================
+
+  String json = "{";
+
+  json += "\"deviceId\":\"";
+  json += DEVICE_ID;
+  json += "\",";
+
+  // No valid heart rate -> JSON null, never a stale reading.
+  json += "\"heartRate\":";
+
+  if (fingerPresentNow &&
+      lastValidBPM > 0 &&
+      millis() - lastValidBPMAt <= VITALS_MAX_AGE) {
+
+    json += String(lastValidBPM);
+
+  } else {
+    json += "null";
+  }
+
+  json += ",";
+
+  json += "\"spo2\":";
+
+  if (fingerPresentNow &&
+      lastValidSpO2 > 0 &&
+      millis() - lastValidSpO2At <= VITALS_MAX_AGE) {
+
+    json += String(lastValidSpO2);
+
+  } else {
+    json += "null";
+  }
+
+  json += ",";
+
+  json += "\"status\":\"";
+
+  if (fallEventPending) {
+
+    json += "FALL_ALERT";
+
+  } else if (sosEventPending) {
+
+    json += "SOS_ALERT";
+
+  } else {
+
+    json += "NORMAL";
+  }
+
+  json += "\",";
+
+  // Only a fall event sets fallAlert to true.
+  json += "\"fallAlert\":";
+
+  json += fallEventPending ? "true" : "false";
+
+  json += "}";
+
+  // ================= SERIAL =================
+
+  Serial.println();
+  Serial.println("========== SENDING DATA ==========");
+  Serial.println(json);
+
+  // ================= HTTP POST =================
+
+  HTTPClient http;
+
+  http.begin(API_URL);
+
+  http.addHeader(
+    "Content-Type",
+    "application/json"
+  );
+
+  int httpResponseCode = http.POST(json);
+
+  Serial.print("HTTP Response Code: ");
+  Serial.println(httpResponseCode);
+
+  if (httpResponseCode > 0) {
+
+    String response = http.getString();
+
+    Serial.print("Server Response: ");
+    Serial.println(response);
+
+    // Clear events only after a successful server response.
+    if (httpResponseCode >= 200 &&
+        httpResponseCode < 300) {
+
+      fallEventPending = false;
+      sosEventPending = false;
+
+      Serial.println(
+        "Pending emergency events successfully sent."
+      );
+    }
+
+  } else {
+
+    Serial.print("POST Error: ");
+
+    Serial.println(
+      http.errorToString(httpResponseCode)
+    );
+
+    Serial.println(
+      "Emergency event will remain pending."
+    );
+  }
+
+  http.end();
+
+  Serial.println("==================================");
+  Serial.println();
+}
+
+
+// =================================================
+// SETUP
+// =================================================
+
+void setup() {
+
+  Serial.begin(115200);
+
+  delay(1000);
+
+  // ================= I2C =================
+
+  Wire.begin(21, 22);
+
+  Wire.setTimeOut(100);
+
+  // ================= OUTPUTS =================
+
+  pinMode(MOTOR_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(GREEN_LED, OUTPUT);
+  pinMode(RED_LED, OUTPUT);
+
+  pinMode(SOS_BUTTON_PIN, INPUT_PULLUP);
+
+  digitalWrite(MOTOR_PIN, LOW);
+  digitalWrite(BUZZER_PIN, LOW);
+  digitalWrite(GREEN_LED, LOW);
+  digitalWrite(RED_LED, LOW);
+
+  // ================= START =================
+
+  Serial.println();
+  Serial.println("Starting Smart Health Band...");
+  Serial.println();
+
+  // ================= MAX30102 =================
+
+  if (!maxSensor.begin(Wire)) {
+
+    Serial.println("MAX30102 NOT FOUND");
+
+    while (1) {
+
+      digitalWrite(GREEN_LED, LOW);
+
+      delay(500);
+    }
+  }
+
+  byte ledBrightness = 0x1F;
+  byte sampleAverage = 4;
+  byte ledMode = 2;
+
+  int sampleRate = 100;
+  int pulseWidth = 411;
+  int adcRange = 4096;
+
+  maxSensor.setup(
+    ledBrightness,
+    sampleAverage,
+    ledMode,
+    sampleRate,
+    pulseWidth,
+    adcRange
+  );
+
+  Serial.println("MAX30102 OK");
+
+  // ================= MPU6050 =================
+
+  writeMPU(0x6B, 0x00);
+  writeMPU(0x1C, 0x00);
+
+  Serial.println("MPU OK");
+
+  // ================= WIFI =================
+
+  connectWiFi();
+
+  // ================= READY =================
+
+  Serial.println();
+  Serial.println("-----------------------------");
+  Serial.println("SMART HEALTH BAND READY");
+  Serial.println("-----------------------------");
+
+  Serial.println("Heart Rate : Monitoring");
+  Serial.println("SpO2       : Monitoring");
+  Serial.println("Fall       : Freefall + impact + stillness");
+  Serial.println("Emergency  : Buzzer + Motor");
+  Serial.println("WiFi       : Monitoring");
+  Serial.println("API        : /api/data");
+  Serial.println("JSON       : Every 30 seconds");
+
+  Serial.println("-----------------------------");
+  Serial.println();
+}
+
+
+// =================================================
+// LOOP
+// =================================================
+
+void loop() {
+
+  // Collect MAX30102 samples
+  collectVitalsSample();
+
+  // Calculate HR + SpO2
+  computeVitalsIfDue();
+
+  // Collect and upload MPU6050 samples to the separate motion API
+  collectMotionSample();
+
+  // Check fall
+  updateFallDetection();
+
+  // Check emergency SOS button
+  updateSOSButton();
+
+  // Control buzzer, motor and LEDs
+  updateIndicators();
+
+  // Check WiFi
+  checkWiFi();
+
+  // Send data to backend
+  sendHealthJSON();
+
+  delay(100);
+}
